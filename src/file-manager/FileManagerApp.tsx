@@ -608,6 +608,7 @@ export function FileManagerApp() {
               onSelectAll={selectAll}
               onDownloadArchive={() => void downloadArchive()}
               onDeleteSelected={() => void deleteSelected()}
+              onUnauthorized={() => setAuthed(false)}
               selectedCount={selectedPaths.length}
             />
           ) : (

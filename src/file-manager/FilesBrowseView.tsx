@@ -1,4 +1,5 @@
-import { Archive, Download, File, Folder, FolderPlus, RefreshCw, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { Archive, Download, File, Folder, FolderPlus, Link2, RefreshCw, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,6 +23,7 @@ type Props = {
   onSelectAll: () => void;
   onDownloadArchive: () => void;
   onDeleteSelected: () => void;
+  onUnauthorized: () => void;
   selectedCount: number;
 };
 
@@ -40,9 +42,48 @@ export function FilesBrowseView({
   onSelectAll,
   onDownloadArchive,
   onDeleteSelected,
+  onUnauthorized,
   selectedCount,
 }: Props) {
   const crumbs = breadcrumbItems(path);
+  const [copiedRel, setCopiedRel] = useState<string | null>(null);
+  const [copyErrorRel, setCopyErrorRel] = useState<string | null>(null);
+
+  async function copyExternalDownloadLink(rel: string) {
+    setCopyErrorRel(null);
+    try {
+      const res = await fetch(`${FM_API}/download-link`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: rel }),
+      });
+      if (res.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      if (!res.ok) {
+        setCopyErrorRel(rel);
+        window.setTimeout(() => setCopyErrorRel(c => (c === rel ? null : c)), 2500);
+        return;
+      }
+      const data = (await res.json()) as { url?: string };
+      if (!data.url) {
+        setCopyErrorRel(rel);
+        window.setTimeout(() => setCopyErrorRel(c => (c === rel ? null : c)), 2500);
+        return;
+      }
+      const full = `${window.location.origin}${data.url}`;
+      await navigator.clipboard.writeText(full);
+      setCopiedRel(rel);
+      window.setTimeout(() => {
+        setCopiedRel(c => (c === rel ? null : c));
+      }, 2000);
+    } catch {
+      setCopyErrorRel(rel);
+      window.setTimeout(() => setCopyErrorRel(c => (c === rel ? null : c)), 2500);
+    }
+  }
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -155,7 +196,7 @@ export function FilesBrowseView({
                 <th className="fm-label text-[#868584] hidden w-44 px-3 py-3 font-normal lg:table-cell">
                   Изменён
                 </th>
-                <th className="fm-label text-[#868584] w-28 px-3 py-3 text-right font-normal"></th>
+                <th className="fm-label text-[#868584] min-w-[10rem] px-3 py-3 text-right font-normal"></th>
               </tr>
             </thead>
             <tbody>
@@ -207,14 +248,37 @@ export function FilesBrowseView({
                       </td>
                       <td className="px-3 py-2 text-right align-middle">
                         {it.type === "file" ? (
-                          <a
-                            className="fm-link inline-flex items-center justify-end gap-1 text-sm text-[#666469] underline underline-offset-4 hover:text-[#faf9f6]"
-                            href={href}
-                            download={it.name}
-                          >
-                            <Download className="size-4" />
-                            <span className="hidden sm:inline">Скачать</span>
-                          </a>
+                          <div className="flex flex-wrap items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              className="fm-link inline-flex items-center justify-end gap-1 text-sm text-[#666469] underline underline-offset-4 hover:text-[#faf9f6] disabled:opacity-50"
+                              disabled={busy}
+                              title={
+                                copiedRel === rel
+                                  ? "Ссылка скопирована"
+                                  : "Скопировать прямую ссылку (curl, wget, менеджеры загрузок)"
+                              }
+                              aria-label={`Скопировать прямую ссылку на ${it.name}`}
+                              onClick={() => void copyExternalDownloadLink(rel)}
+                            >
+                              <Link2 className="size-4 shrink-0" />
+                              <span className="hidden sm:inline">
+                                {copiedRel === rel
+                                  ? "Скопировано"
+                                  : copyErrorRel === rel
+                                    ? "Ошибка"
+                                    : "Ссылка"}
+                              </span>
+                            </button>
+                            <a
+                              className="fm-link inline-flex items-center justify-end gap-1 text-sm text-[#666469] underline underline-offset-4 hover:text-[#faf9f6]"
+                              href={href}
+                              download={it.name}
+                            >
+                              <Download className="size-4" />
+                              <span className="hidden sm:inline">Скачать</span>
+                            </a>
+                          </div>
                         ) : (
                           <span className="text-[#868584] text-sm opacity-60">—</span>
                         )}

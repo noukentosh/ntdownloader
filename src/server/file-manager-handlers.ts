@@ -24,6 +24,17 @@ function maxFetchBytes(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_FETCH;
 }
 
+const DEFAULT_DOWNLOAD_LINK_TTL_SEC = 3600;
+const MAX_DOWNLOAD_LINK_TTL_SEC = 7 * 24 * 60 * 60;
+
+function defaultDownloadLinkTtlSec(): number {
+  const n = Number(process.env.FILE_MANAGER_DOWNLOAD_LINK_TTL_SEC);
+  if (Number.isFinite(n) && n > 0) {
+    return Math.min(Math.floor(n), MAX_DOWNLOAD_LINK_TTL_SEC);
+  }
+  return DEFAULT_DOWNLOAD_LINK_TTL_SEC;
+}
+
 /** In-memory URL fetch jobs (lost on server restart). */
 type FetchJobStatus = "downloading" | "done" | "error" | "cancelled";
 
@@ -257,12 +268,49 @@ function verifySessionToken(token: string, secret: string): boolean {
   }
   let exp: number;
   try {
-    const o = JSON.parse(payloadJson) as { exp?: number };
+    const o = JSON.parse(payloadJson) as { exp?: number; typ?: string };
+    if (o.typ === "file-download") return false;
+    if (o.typ != null && o.typ !== "session") return false;
     exp = typeof o.exp === "number" ? o.exp : 0;
   } catch {
     return false;
   }
   return exp > Date.now();
+}
+
+type DownloadLinkPayload = { exp: number; path: string; typ: "file-download" };
+
+function verifyDownloadLinkToken(token: string, secret: string): DownloadLinkPayload | null {
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const payloadB64 = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  let payloadJson: string;
+  try {
+    payloadJson = Buffer.from(payloadB64, "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+  const expected = createHmac("sha256", secret).update(payloadJson).digest("base64url");
+  try {
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length) return null;
+    if (!timingSafeEqual(a, b)) return null;
+  } catch {
+    return null;
+  }
+  let o: Partial<DownloadLinkPayload>;
+  try {
+    o = JSON.parse(payloadJson) as Partial<DownloadLinkPayload>;
+  } catch {
+    return null;
+  }
+  if (o.typ !== "file-download") return null;
+  if (typeof o.path !== "string" || o.path.length === 0) return null;
+  const exp = typeof o.exp === "number" ? o.exp : 0;
+  if (exp <= Date.now()) return null;
+  return { exp, path: o.path, typ: "file-download" };
 }
 
 export function requireSession(req: Request): Response | null {
@@ -314,6 +362,33 @@ function contentDispositionAttachment(filename: string): string {
   const ascii = filename.replace(/[^\x20-\x7E]/g, "_");
   const encoded = encodeURIComponent(filename);
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+async function fileDownloadResponse(root: string, rel: string): Promise<Response> {
+  let fileAbs: string;
+  try {
+    fileAbs = safeResolveUnderRoot(root, rel);
+  } catch (e) {
+    const status = e instanceof HttpError ? e.status : 400;
+    return Response.json({ error: e instanceof Error ? e.message : "Bad path" }, { status });
+  }
+  let st;
+  try {
+    st = await stat(fileAbs);
+  } catch {
+    return Response.json({ error: "Not found" }, { status: 404 });
+  }
+  if (!st.isFile()) {
+    return Response.json({ error: "Not a file" }, { status: 400 });
+  }
+  const file = Bun.file(fileAbs);
+  const base = path.basename(fileAbs);
+  return new Response(file, {
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "Content-Disposition": contentDispositionAttachment(base),
+    },
+  });
 }
 
 function parseFilenameFromCd(header: string | null): string | undefined {
@@ -453,7 +528,7 @@ export const fileManagerRoutes = {
         return Response.json({ error: "Invalid credentials" }, { status: 401 });
       }
       const exp = Date.now() + SESSION_MAX_MS;
-      const payloadJson = JSON.stringify({ exp });
+      const payloadJson = JSON.stringify({ exp, typ: "session" });
       const token = signPayload(payloadJson, secret);
       return Response.json({ ok: true }, {
         headers: { "Set-Cookie": sessionCookieHeader(token, Math.floor(SESSION_MAX_MS / 1000)) },
@@ -797,13 +872,20 @@ export const fileManagerRoutes = {
     },
   },
 
-  "/api/file-manager/download": {
-    async GET(req: Request) {
+  "/api/file-manager/download-link": {
+    async POST(req: Request) {
       const deny = requireSession(req);
       if (deny) return deny;
+      const secret = getSecret();
+      if (!secret) {
+        return Response.json({ error: "FILE_MANAGER_SECRET is not set" }, { status: 503 });
+      }
+      const body = (await readJsonBody(req)) as { path?: unknown; ttlSec?: unknown };
+      const rel = typeof body.path === "string" ? body.path : "";
+      if (!rel) {
+        return Response.json({ error: "path is required" }, { status: 400 });
+      }
       const root = getUploadsRoot();
-      const url = new URL(req.url);
-      const rel = url.searchParams.get("path") ?? "";
       let fileAbs: string;
       try {
         fileAbs = safeResolveUnderRoot(root, rel);
@@ -820,14 +902,52 @@ export const fileManagerRoutes = {
       if (!st.isFile()) {
         return Response.json({ error: "Not a file" }, { status: 400 });
       }
-      const file = Bun.file(fileAbs);
-      const base = path.basename(fileAbs);
-      return new Response(file, {
-        headers: {
-          "Content-Type": file.type || "application/octet-stream",
-          "Content-Disposition": contentDispositionAttachment(base),
-        },
-      });
+
+      let ttlSec = defaultDownloadLinkTtlSec();
+      if (body.ttlSec !== undefined && body.ttlSec !== null) {
+        const n = Number(body.ttlSec);
+        if (!Number.isFinite(n) || n <= 0) {
+          return Response.json({ error: "ttlSec must be a positive number" }, { status: 400 });
+        }
+        ttlSec = Math.min(Math.floor(n), MAX_DOWNLOAD_LINK_TTL_SEC);
+      }
+
+      const exp = Date.now() + ttlSec * 1000;
+      const payloadJson = JSON.stringify({
+        exp,
+        path: rel,
+        typ: "file-download",
+      } satisfies DownloadLinkPayload);
+      const dlToken = signPayload(payloadJson, secret);
+      const q = new URLSearchParams();
+      q.set("path", rel);
+      q.set("dl_token", dlToken);
+      return Response.json({ url: `/api/file-manager/download?${q.toString()}` });
+    },
+  },
+
+  "/api/file-manager/download": {
+    async GET(req: Request) {
+      const secret = getSecret();
+      if (!secret) {
+        return Response.json({ error: "FILE_MANAGER_SECRET is not set" }, { status: 503 });
+      }
+      const url = new URL(req.url);
+      const rel = url.searchParams.get("path") ?? "";
+      const cookieTok = getCookie(req, SESSION_COOKIE);
+      const sessionOk = !!(cookieTok && verifySessionToken(cookieTok, secret));
+      if (!sessionOk) {
+        const rawDl = url.searchParams.get("dl_token");
+        if (!rawDl) {
+          return Response.json({ error: "Unauthorized" }, { status: 401 });
+        }
+        const payload = verifyDownloadLinkToken(rawDl, secret);
+        if (!payload || payload.path !== rel) {
+          return Response.json({ error: "Unauthorized" }, { status: 401 });
+        }
+      }
+      const root = getUploadsRoot();
+      return fileDownloadResponse(root, rel);
     },
   },
 
