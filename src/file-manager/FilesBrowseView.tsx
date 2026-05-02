@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Archive, Download, File, Folder, FolderPlus, Link2, RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Archive, Copy, Download, File, Folder, FolderPlus, Link2, RefreshCw, Trash2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -27,6 +27,11 @@ type Props = {
   selectedCount: number;
 };
 
+type DirectLinkModal =
+  | { phase: "loading"; fileName: string }
+  | { phase: "ready"; fileName: string; url: string }
+  | { phase: "error"; fileName: string; message: string };
+
 export function FilesBrowseView({
   path,
   items,
@@ -46,11 +51,34 @@ export function FilesBrowseView({
   selectedCount,
 }: Props) {
   const crumbs = breadcrumbItems(path);
-  const [copiedRel, setCopiedRel] = useState<string | null>(null);
-  const [copyErrorRel, setCopyErrorRel] = useState<string | null>(null);
+  const [directLinkModal, setDirectLinkModal] = useState<DirectLinkModal | null>(null);
+  const [modalCopyDone, setModalCopyDone] = useState(false);
+  const urlInputRef = useRef<HTMLInputElement>(null);
 
-  async function copyExternalDownloadLink(rel: string) {
-    setCopyErrorRel(null);
+  useEffect(() => {
+    if (!directLinkModal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDirectLinkModal(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [directLinkModal]);
+
+  useEffect(() => {
+    if (directLinkModal?.phase === "ready") {
+      urlInputRef.current?.focus();
+      urlInputRef.current?.select();
+    }
+  }, [directLinkModal]);
+
+  function closeDirectLinkModal() {
+    setDirectLinkModal(null);
+    setModalCopyDone(false);
+  }
+
+  async function openDirectLinkModal(rel: string, fileName: string) {
+    setModalCopyDone(false);
+    setDirectLinkModal({ phase: "loading", fileName });
     try {
       const res = await fetch(`${FM_API}/download-link`, {
         method: "POST",
@@ -59,34 +87,136 @@ export function FilesBrowseView({
         body: JSON.stringify({ path: rel }),
       });
       if (res.status === 401) {
+        closeDirectLinkModal();
         onUnauthorized();
         return;
       }
       if (!res.ok) {
-        setCopyErrorRel(rel);
-        window.setTimeout(() => setCopyErrorRel(c => (c === rel ? null : c)), 2500);
+        const j = (await res.json().catch(() => ({}))) as { error?: string };
+        setDirectLinkModal({
+          phase: "error",
+          fileName,
+          message: j.error ?? `Ошибка ${res.status}`,
+        });
         return;
       }
       const data = (await res.json()) as { url?: string };
       if (!data.url) {
-        setCopyErrorRel(rel);
-        window.setTimeout(() => setCopyErrorRel(c => (c === rel ? null : c)), 2500);
+        setDirectLinkModal({
+          phase: "error",
+          fileName,
+          message: "Сервер не вернул ссылку",
+        });
         return;
       }
       const full = `${window.location.origin}${data.url}`;
-      await navigator.clipboard.writeText(full);
-      setCopiedRel(rel);
-      window.setTimeout(() => {
-        setCopiedRel(c => (c === rel ? null : c));
-      }, 2000);
+      setDirectLinkModal({ phase: "ready", fileName, url: full });
     } catch {
-      setCopyErrorRel(rel);
-      window.setTimeout(() => setCopyErrorRel(c => (c === rel ? null : c)), 2500);
+      setDirectLinkModal({
+        phase: "error",
+        fileName,
+        message: "Не удалось получить ссылку",
+      });
+    }
+  }
+
+  async function copyUrlFromModal(url: string) {
+    const ok = await copyTextToClipboard(url);
+    if (ok) {
+      setModalCopyDone(true);
+      window.setTimeout(() => setModalCopyDone(false), 2000);
     }
   }
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {directLinkModal ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="fm-direct-link-title"
+          onClick={closeDirectLinkModal}
+        >
+          <div
+            className="border-mist relative w-full max-w-lg rounded-xl border bg-[#1a1918] p-5 shadow-xl"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <h2 id="fm-direct-link-title" className="text-[#faf9f6] pr-8 text-lg font-normal tracking-tight">
+                {directLinkModal.phase === "error" ? "Ошибка" : "Ссылка"}: {directLinkModal.fileName}
+              </h2>
+              <button
+                type="button"
+                className="text-[#868584] hover:text-[#faf9f6] absolute top-4 right-4 rounded-md p-1"
+                aria-label="Закрыть"
+                onClick={closeDirectLinkModal}
+              >
+                <X className="size-5" />
+              </button>
+            </div>
+
+            {directLinkModal.phase === "loading" ? (
+              <p className="text-[#868584] mt-4 text-sm">Получаем ссылку…</p>
+            ) : null}
+
+            {directLinkModal.phase === "error" ? (
+              <p className="text-[#c4a89c] mt-4 text-sm">{directLinkModal.message}</p>
+            ) : null}
+
+            {directLinkModal.phase === "ready" ? (
+              <div className="mt-4 space-y-3">
+                <Label htmlFor="fm-direct-link-url" className="fm-label text-[#868584]">
+                  Прямая ссылка (wget, curl, менеджеры загрузок)
+                </Label>
+                <Input
+                  ref={urlInputRef}
+                  id="fm-direct-link-url"
+                  readOnly
+                  value={directLinkModal.url}
+                  className="border-mist bg-[rgba(255,255,255,0.06)] font-mono text-sm text-[#faf9f6]"
+                  onFocus={e => e.target.select()}
+                />
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="fm-pill rounded-full bg-[#353534] text-[#afaeac] hover:opacity-95"
+                    onClick={() => void copyUrlFromModal(directLinkModal.url)}
+                  >
+                    <Copy className="size-4" />
+                    {modalCopyDone ? "Скопировано" : "Копировать"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="fm-pill border-mist rounded-full border bg-transparent text-[#afaeac]"
+                    onClick={closeDirectLinkModal}
+                  >
+                    Закрыть
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
+            {directLinkModal.phase === "error" ? (
+              <div className="mt-4">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="fm-pill border-mist rounded-full border bg-transparent text-[#afaeac]"
+                  onClick={closeDirectLinkModal}
+                >
+                  Закрыть
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       <header className="border-mist flex flex-wrap items-start justify-between gap-4 border-b px-6 py-5">
         <div>
           <p className="fm-label text-[#868584]">Хранилище</p>
@@ -253,22 +383,12 @@ export function FilesBrowseView({
                               type="button"
                               className="fm-link inline-flex items-center justify-end gap-1 text-sm text-[#666469] underline underline-offset-4 hover:text-[#faf9f6] disabled:opacity-50"
                               disabled={busy}
-                              title={
-                                copiedRel === rel
-                                  ? "Ссылка скопирована"
-                                  : "Скопировать прямую ссылку (curl, wget, менеджеры загрузок)"
-                              }
-                              aria-label={`Скопировать прямую ссылку на ${it.name}`}
-                              onClick={() => void copyExternalDownloadLink(rel)}
+                              title="Прямая ссылка для внешних загрузчиков"
+                              aria-label={`Показать прямую ссылку на ${it.name}`}
+                              onClick={() => void openDirectLinkModal(rel, it.name)}
                             >
                               <Link2 className="size-4 shrink-0" />
-                              <span className="hidden sm:inline">
-                                {copiedRel === rel
-                                  ? "Скопировано"
-                                  : copyErrorRel === rel
-                                    ? "Ошибка"
-                                    : "Ссылка"}
-                              </span>
+                              <span className="hidden sm:inline">Ссылка</span>
                             </button>
                             <a
                               className="fm-link inline-flex items-center justify-end gap-1 text-sm text-[#666469] underline underline-offset-4 hover:text-[#faf9f6]"
@@ -293,6 +413,34 @@ export function FilesBrowseView({
       </div>
     </div>
   );
+}
+
+/** Clipboard API часто недоступен на HTTP (кроме localhost) — дублируем через textarea. */
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator.clipboard?.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* небезопасный контекст (HTTP), запрет или обрыв user gesture после await fetch */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.top = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 function formatSize(n: number): string {
